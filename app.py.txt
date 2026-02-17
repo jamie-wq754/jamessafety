@@ -1,0 +1,252 @@
+import streamlit as st
+import requests
+from bs4 import BeautifulSoup
+import re
+import hashlib
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from PIL import Image
+import imagehash
+import io
+import matplotlib.pyplot as plt
+from sklearn.cluster import AgglomerativeClustering
+import warnings
+import time
+warnings.filterwarnings('ignore')
+
+class TraffickScan:
+    def __init__(self):
+        self.profiles = []  # Each: {'url':, 'phone_hash':, 'phone_raw':, 'text':, 'images': [hashes], 'indicators': {}}
+        self.vectorizer = TfidfVectorizer(max_features=800, stop_words='english')
+
+    def scrape_search_page(self, url, progress_bar):
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+        except Exception as e:
+            st.error(f"Could not load search page: {str(e)}")
+            return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # ── CUSTOMIZE THESE SELECTORS ───────────────────────────────────────
+        # Look for <a> tags linking to profiles (inspect real site!)
+        profile_links = soup.find_all('a', href=True)
+        links = []
+        for a in profile_links:
+            href = a['href']
+            # Common patterns: /profile/123, /ad/abc, /escort/name-123
+            if any(p in href.lower() for p in ['/profile/', '/ad/', '/escort/', '/listing/', '/girl/']):
+                full_url = href if href.startswith('http') else url.rstrip('/') + '/' + href.lstrip('/')
+                links.append(full_url)
+
+        total = min(len(links), 30)  # Safety limit
+        if total == 0:
+            st.warning("No profile links found. Adjust selectors in code.")
+            return
+
+        for i, full_url in enumerate(links[:30]):
+            self._scrape_profile(full_url)
+            progress_bar.progress((i + 1) / total)
+            time.sleep(1.5)  # Polite delay – increase if blocked
+
+    def _scrape_profile(self, url):
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        try:
+            response = requests.get(url, headers=headers, timeout=12)
+            response.raise_for_status()
+        except:
+            return  # Skip broken profiles silently
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # ── CUSTOMIZE THESE SELECTORS ───────────────────────────────────────
+        # Text/description
+        text_elem = (
+            soup.find('div', class_=['description', 'bio', 'about', 'profile-text', 'content']) or
+            soup.find('p', class_=['about-me', 'service-text']) or
+            soup.find('div', id=re.compile('desc|bio|about', re.I)) or
+            soup.find('article')
+        )
+        text = text_elem.get_text(strip=True, separator=' ') if text_elem else ''
+
+        # Phone – UK format, handles some obfuscation (spaces, zero, etc.)
+        phone_pattern = r'(?:\+?44|0)?\s*7\d{3}\s*\d{3}\s*\d{3}|zero.*?seven.*?\d{3}.*?\d{3}'
+        phone_match = re.search(phone_pattern, text + ' ' + str(soup), re.I)
+        phone_raw = phone_match.group(0) if phone_match else ''
+        phone_hash = hashlib.sha256(phone_raw.encode('utf-8', errors='ignore')).hexdigest() if phone_raw else None
+
+        # Images – top few profile pics
+        img_tags = soup.find_all('img', src=True)
+        image_hashes = []
+        for img in img_tags[:4]:  # Limit to 4
+            src = img['src']
+            if not src.startswith('http'): continue
+            try:
+                img_resp = requests.get(src, headers=headers, timeout=8)
+                img = Image.open(io.BytesIO(img_resp.content))
+                phash = str(imagehash.phash(img))
+                image_hashes.append(phash)
+            except:
+                pass
+
+        # Indicators (basic flags)
+        indicators = {
+            'obscured_phone': bool(re.search(r'zero|o\s*ne|emoji|[\u200B-\u200F]', phone_raw, re.I)),
+            'youth_language': bool(re.search(r'\b(young|teen|18|barely|fresh|new in town)\b', text, re.I)),
+            'trustworthy_phrase': bool(re.search(r'\b(real|genuine|100%|verified|no agency|independent)\b', text, re.I)),
+            'in_call_only': bool(re.search(r'\b(incall only|outcall no|no outcall)\b', text, re.I))
+        }
+
+        self.profiles.append({
+            'url': url,
+            'phone_hash': phone_hash,
+            'phone_raw': phone_raw.strip()[:30],  # Truncate for privacy/display
+            'text': text[:500],  # Truncate long texts
+            'images': image_hashes,
+            'indicators': indicators
+        })
+
+    def analyze_phones(self):
+        from collections import Counter
+        hashes = [p['phone_hash'] for p in self.profiles if p['phone_hash']]
+        count = Counter(hashes)
+        return {h: c for h, c in count.items() if c > 1}
+
+    def analyze_text(self):
+        texts = [p['text'] for p in self.profiles if p['text'].strip()]
+        if len(texts) < 2:
+            return {}
+        tfidf = self.vectorizer.fit_transform(texts)
+        sim = cosine_similarity(tfidf)
+        clustering = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=0.12,  # ~0.88 similarity
+            linkage='average'
+        ).fit(1 - sim)
+        clusters = {}
+        for idx, label in enumerate(clustering.labels_):
+            clusters.setdefault(label, []).append(idx)
+        return {k: v for k, v in clusters.items() if len(v) > 1}
+
+    def analyze_images(self):
+        all_img = []
+        for i, p in enumerate(self.profiles):
+            for h in p['images']:
+                all_img.append((i, h))
+        clusters = {}
+        for j in range(len(all_img)):
+            for k in range(j + 1, len(all_img)):
+                idx1, h1 = all_img[j]
+                idx2, h2 = all_img[k]
+                try:
+                    dist = imagehash.hex_to_hash(h1) - imagehash.hex_to_hash(h2)
+                    if dist <= 8:  # Similar images
+                        key = min(idx1, idx2)
+                        clusters.setdefault(key, set()).update([idx1, idx2])
+                except:
+                    pass
+        return {k: list(v) for k, v in clusters.items() if len(v) > 1}
+
+    def compute_risk_scores(self, phone_dups, text_clusters, img_clusters):
+        scores = []
+        for i, p in enumerate(self.profiles):
+            base = sum(p['indicators'].values())  # 0–4
+            extra = 0
+            if p['phone_hash'] in phone_dups:
+                extra += 3
+            for cl in text_clusters.values():
+                if i in cl:
+                    extra += 1  # Lower weight for text (AI common)
+            for cl in img_clusters.values():
+                if i in cl:
+                    extra += 3
+            scores.append(base + extra)
+        return scores
+
+    def generate_report(self):
+        phone_dups = self.analyze_phones()
+        text_clusters = self.analyze_text()
+        img_clusters = self.analyze_images()
+        scores = self.compute_risk_scores(phone_dups, text_clusters, img_clusters)
+
+        df = pd.DataFrame(self.profiles)
+        df['risk_score'] = scores
+        df = df.sort_values('risk_score', ascending=False)
+
+        fig = None
+        if len(df) > 1:
+            sample_texts = [t[:300] for t in df['text'].head(12) if t]
+            if sample_texts:
+                tf = self.vectorizer.fit_transform(sample_texts)
+                sim = cosine_similarity(tf)
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.imshow(sim, cmap='YlOrRd', interpolation='nearest')
+                ax.set_title('Text Similarity Heatmap (Sample)')
+
+        return df, fig, phone_dups, text_clusters, img_clusters
+
+
+# ── STREAMLIT APP ────────────────────────────────────────────────────────
+st.set_page_config(page_title="TraffickScan – Ethical Detector", layout="wide")
+
+st.title("TraffickScan – Potential Trafficking Red-Flag Scanner")
+st.markdown("""
+**For authorised ethical use only** (law enforcement, NGOs, researchers).  
+Always report findings to the UK Modern Slavery Helpline (08000 121 700).  
+Customize selectors in code for each target site.
+""")
+
+url_input = st.text_input(
+    "Paste full **search results** URL:",
+    placeholder="https://example.com/search?location=london&sort=newest"
+)
+
+max_profiles = st.slider("Max profiles to scan (safety limit)", 10, 60, 30)
+
+if st.button("Run Analysis") and url_input:
+    with st.spinner("Scanning profiles... (be patient)"):
+        progress = st.progress(0)
+        scanner = TraffickScan()
+        scanner.scrape_search_page(url_input, progress)
+
+        if not scanner.profiles:
+            st.error("No usable profiles found. Check URL / adjust selectors.")
+        else:
+            df, fig, phone_dups, text_cl, img_cl = scanner.generate_report()
+
+            st.success(f"Processed {len(df)} profiles.")
+
+            cols = st.columns(4)
+            cols[0].metric("High Risk (>6)", len(df[df['risk_score'] > 6]))
+            cols[1].metric("Phone Dupes", len(phone_dups))
+            cols[2].metric("Text Clusters", len(text_cl))
+            cols[3].metric("Image Dupes", len(img_cl))
+
+            st.subheader("Results Table (sorted by risk)")
+            st.dataframe(
+                df[['url', 'phone_raw', 'risk_score', 'phone_hash', 'indicators']],
+                use_container_width=True,
+                column_config={"url": st.column_config.LinkColumn("Profile URL")}
+            )
+
+            if fig:
+                st.subheader("Text Similarity Heatmap (sample)")
+                st.pyplot(fig)
+
+            # Download
+            csv_bytes = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Download Full CSV Report",
+                data=csv_bytes,
+                file_name="traffickscan_report.csv",
+                mime="text/csv"
+            )
+
+st.info("""
+Run locally: streamlit run app.py  
+Deploy: Upload app.py + requirements.txt to GitHub → deploy on share.streamlit.io
+""")
